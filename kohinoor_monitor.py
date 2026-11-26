@@ -8,7 +8,6 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
-from bs4 import BeautifulSoup
 
 import monitor
 
@@ -76,6 +75,7 @@ async def discover_urls(client: httpx.AsyncClient, keyword: str) -> list[dict]:
             add_watch(urljoin(BASE_URL, rel.lstrip("/")))
 
     return watches
+
 
 async def check_one_async(
     client: httpx.AsyncClient, sem: asyncio.Semaphore, product: dict
@@ -146,9 +146,13 @@ async def run_collection_cycle_async() -> None:
                 )
 
                 if should_alert:
-                    monitor.send_telegram(result)
-                    entry["last_alerted_at"] = now
-                    print(f"  RESTOCK ALERT SENT: {result.name} ({result.price})")
+                    try:
+                        monitor.send_telegram(result)
+                        entry["last_alerted_at"] = now
+                        print(f"  RESTOCK ALERT SENT: {result.name} ({result.price})")
+                    except Exception as exc:
+                        print(f"  Telegram failed for {result.name}: {exc} (will retry next cycle)")
+                        continue
 
                 entry["status"] = result.status
                 entry["last_checked_at"] = now
