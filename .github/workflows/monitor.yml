@@ -1,0 +1,47 @@
+name: HMT Kohinoor Stock Monitor
+
+on:
+  schedule:
+    - cron: "3-58/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hmt-kohinoor-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-stock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install "httpx[http2]" beautifulsoup4 lxml
+
+      - name: Run Kohinoor monitor (4.5-min loop)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOOP: "1"
+          POLL_SECONDS: "35"
+          MAX_RUNTIME_SECONDS: "270"
+        run: python kohinoor_monitor.py
+
+      - name: Save updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add kohinoor_state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update kohinoor state [skip ci]"
+            git push
+          fi

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "kohinoor-b1-dark-blue",
+    "name": "HMT Kohinoor Quartz B1 Dark Blue Sunray",
+    "url": "https://www.hmtwatches.in/product-1171-hmt-kohinoor-quartz-b1-dark-blue-sunray",
+    "purchase_root_selector": "div._product-detail-content",
+    "price_selector": ".price, .product-price, ._p-price-box",
+    "enabled": true
+  }
+]
