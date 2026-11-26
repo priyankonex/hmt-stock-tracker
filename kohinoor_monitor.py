@@ -31,41 +31,51 @@ def save_state(state: dict) -> None:
 
 
 async def discover_urls(client: httpx.AsyncClient, keyword: str) -> list[dict]:
-    url = f"{BASE_URL}search_products?keys={keyword}&_t={int(time.time())}"
-    try:
-        resp = await client.get(url, headers=monitor.HEADERS, timeout=25.0)
-        if resp.status_code != 200:
-            print(f"[{keyword}] Search HTTP {resp.status_code} — skipping discovery")
-            return []
-    except httpx.HTTPError as exc:
-        print(f"[{keyword}] Search network timeout/error ({exc}) — will retry next cycle")
-        return []
-
-    soup = BeautifulSoup(resp.text, "lxml")
     seen: set[str] = set()
     watches: list[dict] = []
 
-    for link in soup.select('a[href*="product-"]'):
-        full_url = urljoin(BASE_URL, link.get("href", "").strip()).split("?")[0]
-        if full_url in seen or keyword.lower() not in full_url.lower():
-            continue
-        seen.add(full_url)
-
-        slug_match = re.search(r"(product-\d+-[a-z0-9-]+)", full_url, re.I)
-        watch_id = slug_match.group(1).lower() if slug_match else full_url
-        # Clean human-readable fallback name from URL slug
-        pretty_name = re.sub(r"^product-\d+-", "", watch_id).replace("-", " ").title()
-
+    def add_watch(full_url: str, fallback_name: str = "") -> None:
+        clean_url = full_url.split("?")[0].strip()
+        if not clean_url or clean_url in seen or keyword.lower() not in clean_url.lower():
+            return
+        seen.add(clean_url)
+        slug_match = re.search(r"(product-\d+-[a-z0-9-]+)", clean_url, re.I)
+        watch_id = slug_match.group(1).lower() if slug_match else clean_url
+        pretty_name = fallback_name or re.sub(r"^product-\d+-", "", watch_id).replace("-", " ").title()
         watches.append({
             "id": watch_id,
             "name": pretty_name,
-            "url": full_url,
+            "url": clean_url,
             "purchase_root_selector": "div._product-detail-content",
             "price_selector": ".price, .product-price, ._p-price-box",
         })
 
-    return watches
+    # 1. Include any manual favorites from products.json
+    if Path("products.json").exists():
+        for item in json.loads(Path("products.json").read_text(encoding="utf-8")):
+            if item.get("enabled", True):
+                add_watch(item["url"], item.get("name", ""))
 
+    # 2. Scan Search + Collection + Sitemap concurrently
+    sources = [
+        f"{BASE_URL}search_products?keys={keyword}&_t={int(time.time())}",
+        f"{BASE_URL}all_product?type=shop_collection&id=51&_t={int(time.time())}",
+        f"{BASE_URL}sitemap.xml",
+    ]
+    responses = await asyncio.gather(
+        *(client.get(u, headers=monitor.HEADERS, timeout=25.0) for u in sources),
+        return_exceptions=True,
+    )
+
+    for resp in responses:
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            continue
+        for slug in re.findall(r"https?://[^\"'<\s]*product-\d+-[a-z0-9-]+", resp.text, re.I):
+            add_watch(slug)
+        for rel in re.findall(r"(?:href=[\"\']|/)?(product-\d+-[a-z0-9-]+)", resp.text, re.I):
+            add_watch(urljoin(BASE_URL, rel.lstrip("/")))
+
+    return watches
 
 async def check_one_async(
     client: httpx.AsyncClient, sem: asyncio.Semaphore, product: dict
