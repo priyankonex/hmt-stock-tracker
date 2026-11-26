@@ -119,6 +119,20 @@ def run_collection_cycle() -> None:
     save_state(state)
 
 
+def get_poll_interval() -> float:
+    """15s during HMT's peak IST drop windows, 45s off-peak."""
+    now_ist = monitor.datetime.now(monitor.IST)
+    minutes = now_ist.hour * 60 + now_ist.minute
+    in_morning_peak = (8 * 60 + 45) <= minutes <= (12 * 60 + 30)   # 8:45 AM - 12:30 PM IST
+    in_evening_peak = (17 * 60 + 45) <= minutes <= (19 * 60 + 0)   # 5:45 PM - 7:00 PM IST
+
+    if in_morning_peak or in_evening_peak:
+        base = int(os.getenv("PEAK_POLL_SECONDS", "15"))
+    else:
+        base = int(os.getenv("POLL_SECONDS", "45"))
+    return max(12.0, base + random.uniform(-0.15 * base, 0.15 * base))
+
+
 if __name__ == "__main__":
     monitor.load_env_file()
     max_runtime = int(os.getenv("MAX_RUNTIME_SECONDS", "0"))
@@ -128,8 +142,7 @@ if __name__ == "__main__":
         run_collection_cycle()
         if os.getenv("LOOP") != "1":
             break
-        base = int(os.getenv("POLL_SECONDS", "35"))
-        sleep_s = max(20.0, base + random.uniform(-0.2 * base, 0.2 * base))
+        sleep_s = get_poll_interval()
         if deadline and (time.time() + sleep_s) >= deadline:
             break
         time.sleep(sleep_s)

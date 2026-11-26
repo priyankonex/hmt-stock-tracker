@@ -2,7 +2,7 @@ name: HMT Kohinoor Stock Monitor
 
 on:
   schedule:
-    - cron: "3-58/5 * * * *"
+    - cron: "3,23,43 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
 
@@ -27,13 +27,14 @@ jobs:
       - name: Install dependencies
         run: pip install "httpx[http2]" beautifulsoup4 lxml
 
-      - name: Run Kohinoor monitor (4.5-min loop)
+      - name: Run Kohinoor monitor (19-min seamless loop)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOOP: "1"
-          POLL_SECONDS: "35"
-          MAX_RUNTIME_SECONDS: "270"
+          PEAK_POLL_SECONDS: "15"
+          POLL_SECONDS: "45"
+          MAX_RUNTIME_SECONDS: "1140"
         run: python kohinoor_monitor.py
 
       - name: Save updated state
