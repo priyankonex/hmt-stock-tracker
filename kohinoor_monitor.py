@@ -15,6 +15,10 @@ BASE_URL = "https://www.hmtwatches.in/"
 SEARCH_KEYWORDS = ["kohinoor"]  # Add "pilot", "janata", etc. anytime
 STATE_FILE = Path("kohinoor_state.json")
 MAX_CONCURRENCY = 4
+DISCOVERY_TTL_SECONDS = 600  # Refresh URL list every 10 minutes
+ERROR_ALERT_THRESHOLD = 10   # Warn after 10 consecutive failed cycles
+
+_DISCOVERY_CACHE: dict[str, tuple[float, list[dict]]] = {}
 
 
 def load_state() -> dict:
@@ -27,6 +31,22 @@ def save_state(state: dict) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     tmp.replace(STATE_FILE)
+
+
+def send_telegram_notice(text: str) -> None:
+    """Sends a lightweight status/heartbeat notice without touching restock logic."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=15.0,
+        )
+    except httpx.HTTPError as exc:
+        print(f"Notice send failed: {exc}")
 
 
 async def discover_urls(client: httpx.AsyncClient, keyword: str) -> list[dict]:
@@ -49,13 +69,11 @@ async def discover_urls(client: httpx.AsyncClient, keyword: str) -> list[dict]:
             "price_selector": ".price, .product-price, ._p-price-box",
         })
 
-    # 1. Include any manual favorites from products.json
     if Path("products.json").exists():
         for item in json.loads(Path("products.json").read_text(encoding="utf-8")):
             if item.get("enabled", True):
                 add_watch(item["url"], item.get("name", ""))
 
-    # 2. Scan Search + Collection + Sitemap concurrently
     sources = [
         f"{BASE_URL}search_products?keys={keyword}&_t={int(time.time())}",
         f"{BASE_URL}all_product?type=shop_collection&id=51&_t={int(time.time())}",
@@ -77,6 +95,17 @@ async def discover_urls(client: httpx.AsyncClient, keyword: str) -> list[dict]:
     return watches
 
 
+async def get_cached_urls(client: httpx.AsyncClient, keyword: str) -> list[dict]:
+    cached = _DISCOVERY_CACHE.get(keyword)
+    now = time.time()
+    if cached and (now - cached[0]) < DISCOVERY_TTL_SECONDS:
+        return cached[1]
+    watches = await discover_urls(client, keyword)
+    if watches:
+        _DISCOVERY_CACHE[keyword] = (now, watches)
+    return watches
+
+
 async def check_one_async(
     client: httpx.AsyncClient, sem: asyncio.Semaphore, product: dict
 ) -> monitor.CheckResult:
@@ -95,7 +124,6 @@ async def check_one_async(
 
             first = monitor.parse_html(resp.text, product)
 
-            # Fast 1.5s confirmation re-check before alerting
             if first.status == "in_stock":
                 await asyncio.sleep(1.5)
                 resp2 = await client.get(
@@ -113,29 +141,43 @@ async def check_one_async(
             return monitor.CheckResult(product["id"], product["name"], product["url"], "unknown")
 
 
+def maybe_send_daily_heartbeat(state: dict, watch_count: int) -> None:
+    """Sends one daily 'alive' ping between 8:45 AM and 9:00 AM IST."""
+    now_ist = monitor.datetime.now(monitor.IST)
+    today = now_ist.strftime("%Y-%m-%d")
+    minutes = now_ist.hour * 60 + now_ist.minute
+    if (8 * 60 + 45) <= minutes <= (9 * 60) and state.get("_last_heartbeat_date") != today:
+        send_telegram_notice(
+            f"HMT Tracker alive — watching {watch_count} Kohinoors (15s peak mode active)."
+        )
+        state["_last_heartbeat_date"] = today
+
+
 async def run_collection_cycle_async() -> None:
     state = load_state()
     items = state.setdefault("items", {})
     baseline_done = state.get("_baseline_done", False)
     now = time.time()
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    total_valid = 0
+    total_checked = 0
 
     async with httpx.AsyncClient(http2=True, follow_redirects=True) as client:
         for kw in SEARCH_KEYWORDS:
-            watches = await discover_urls(client, kw)
+            watches = await get_cached_urls(client, kw)
             if not watches:
                 continue
 
             results = await asyncio.gather(*(check_one_async(client, sem, w) for w in watches))
+            total_checked += len(results)
+            valid_results = [r for r in results if r.status != "unknown"]
+            total_valid += len(valid_results)
             in_stock_count = sum(1 for r in results if r.status == "in_stock")
             print(f"[{kw}] Checked {len(results)} product pages directly ({in_stock_count} in stock)")
 
-            for result in results:
+            for result in valid_results:
                 entry = items.get(result.product_id, {"status": "unknown", "last_alerted_at": 0})
                 prev_status = entry["status"]
-
-                if result.status == "unknown":
-                    continue
 
                 cooldown_ok = (now - entry.get("last_alerted_at", 0)) >= monitor.COOLDOWN_SECONDS
                 should_alert = (
@@ -158,7 +200,19 @@ async def run_collection_cycle_async() -> None:
                 entry["last_checked_at"] = now
                 items[result.product_id] = entry
 
-    state["_baseline_done"] = True
+    # Track consecutive failed cycles (WAF block / HMT outage detection)
+    if total_valid == 0:
+        errors = state.get("_consecutive_errors", 0) + 1
+        state["_consecutive_errors"] = errors
+        if errors == ERROR_ALERT_THRESHOLD:
+            send_telegram_notice(
+                "HMT Tracker warning: 10 consecutive check cycles failed (possible HMT outage or IP throttle)."
+            )
+    else:
+        state["_consecutive_errors"] = 0
+        state["_baseline_done"] = True
+        maybe_send_daily_heartbeat(state, total_checked)
+
     save_state(state)
 
 
