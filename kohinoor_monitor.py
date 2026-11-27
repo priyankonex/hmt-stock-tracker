@@ -14,7 +14,7 @@ import monitor
 BASE_URL = "https://www.hmtwatches.in/"
 SEARCH_KEYWORDS = ["kohinoor"]  # Add "pilot", "janata", etc. anytime
 STATE_FILE = Path("kohinoor_state.json")
-MAX_CONCURRENCY = 4
+MAX_CONCURRENCY = 2
 DISCOVERY_TTL_SECONDS = 600  # Refresh URL list every 10 minutes
 ERROR_ALERT_THRESHOLD = 10   # Warn after 10 consecutive failed cycles
 
@@ -55,7 +55,12 @@ async def discover_urls(client: httpx.AsyncClient, keyword: str) -> list[dict]:
 
     def add_watch(full_url: str, fallback_name: str = "") -> None:
         clean_url = full_url.split("?")[0].strip()
-        if not clean_url or clean_url in seen or keyword.lower() not in clean_url.lower():
+        if (
+            not clean_url
+            or clean_url in seen
+            or keyword.lower() not in clean_url.lower()
+            or "automatic" in clean_url.lower()
+        ):
             return
         seen.add(clean_url)
         slug_match = re.search(r"(product-\d+-[a-z0-9-]+)", clean_url, re.I)
@@ -147,13 +152,14 @@ def maybe_send_daily_heartbeat(state: dict, watch_count: int) -> None:
     today = now_ist.strftime("%Y-%m-%d")
     minutes = now_ist.hour * 60 + now_ist.minute
     if (8 * 60 + 45) <= minutes <= (9 * 60) and state.get("_last_heartbeat_date") != today:
+        peak_s = os.getenv("PEAK_POLL_SECONDS", "35")
         send_telegram_notice(
-            f"HMT Tracker alive — watching {watch_count} Kohinoors (15s peak mode active)."
+            f"HMT Tracker alive — watching {watch_count} Kohinoor Quartz watches ({peak_s}s peak mode active)."
         )
         state["_last_heartbeat_date"] = today
 
 
-async def run_collection_cycle_async() -> None:
+async def run_collection_cycle_async() -> bool:
     state = load_state()
     items = state.setdefault("items", {})
     baseline_done = state.get("_baseline_done", False)
@@ -173,7 +179,7 @@ async def run_collection_cycle_async() -> None:
             valid_results = [r for r in results if r.status != "unknown"]
             total_valid += len(valid_results)
             in_stock_count = sum(1 for r in results if r.status == "in_stock")
-            print(f"[{kw}] Checked {len(results)} product pages directly ({in_stock_count} in stock)")
+            print(f"[{kw}] Checked {len(results)} Quartz pages directly ({in_stock_count} in stock)")
 
             for result in valid_results:
                 entry = items.get(result.product_id, {"status": "unknown", "last_alerted_at": 0})
@@ -214,24 +220,25 @@ async def run_collection_cycle_async() -> None:
         maybe_send_daily_heartbeat(state, total_checked)
 
     save_state(state)
+    return total_valid > 0
 
 
-def run_collection_cycle() -> None:
-    asyncio.run(run_collection_cycle_async())
+def run_collection_cycle() -> bool:
+    return asyncio.run(run_collection_cycle_async())
 
 
 def get_poll_interval() -> float:
-    """15s during HMT's peak IST drop windows, 45s off-peak."""
+    """35s during HMT's peak IST drop windows, 60s off-peak."""
     now_ist = monitor.datetime.now(monitor.IST)
     minutes = now_ist.hour * 60 + now_ist.minute
     in_morning_peak = (8 * 60 + 45) <= minutes <= (12 * 60 + 30)   # 8:45 AM - 12:30 PM IST
     in_evening_peak = (17 * 60 + 45) <= minutes <= (19 * 60 + 0)   # 5:45 PM - 7:00 PM IST
 
     if in_morning_peak or in_evening_peak:
-        base = int(os.getenv("PEAK_POLL_SECONDS", "15"))
+        base = int(os.getenv("PEAK_POLL_SECONDS", "35"))
     else:
-        base = int(os.getenv("POLL_SECONDS", "45"))
-    return max(12.0, base + random.uniform(-0.15 * base, 0.15 * base))
+        base = int(os.getenv("POLL_SECONDS", "60"))
+    return max(20.0, base + random.uniform(-0.15 * base, 0.15 * base))
 
 
 if __name__ == "__main__":
@@ -240,10 +247,11 @@ if __name__ == "__main__":
     deadline = time.time() + max_runtime if max_runtime > 0 else None
 
     while True:
-        run_collection_cycle()
+        healthy = run_collection_cycle()
         if os.getenv("LOOP") != "1":
             break
-        sleep_s = get_poll_interval()
+        # Auto cool-off for 3 minutes if HMT throttles or times out
+        sleep_s = get_poll_interval() if healthy else 180.0
         if deadline and (time.time() + sleep_s) >= deadline:
             break
         time.sleep(sleep_s)
