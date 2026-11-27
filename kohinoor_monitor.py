@@ -8,14 +8,16 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
+from bs4 import BeautifulSoup
 
 import monitor
 
 BASE_URL = "https://www.hmtwatches.in/"
+STORE_KOHINOOR_URL = "https://www.hmtwatches.store/collection/c757ecc9-31e2-4cf7-bcb1-9b29f5c57c41/Kohinoor"
 SEARCH_KEYWORDS = ["kohinoor"]  # Add "pilot", "janata", etc. anytime
 STATE_FILE = Path("kohinoor_state.json")
 MAX_CONCURRENCY = 2
-DISCOVERY_TTL_SECONDS = 600  # Refresh URL list every 10 minutes
+DISCOVERY_TTL_SECONDS = 600  # Refresh hmtwatches.in URL list every 10 minutes
 ERROR_ALERT_THRESHOLD = 10   # Warn after 10 consecutive failed cycles
 
 _DISCOVERY_CACHE: dict[str, tuple[float, list[dict]]] = {}
@@ -146,6 +148,62 @@ async def check_one_async(
             return monitor.CheckResult(product["id"], product["name"], product["url"], "unknown")
 
 
+async def check_hmt_store(client: httpx.AsyncClient) -> list[monitor.CheckResult]:
+    """Checks all Kohinoor Quartz watches on hmtwatches.store in 1 single request."""
+    try:
+        resp = await client.get(
+            f"{STORE_KOHINOOR_URL}?_t={int(time.time())}",
+            headers=monitor.HEADERS,
+            timeout=25.0,
+        )
+        if resp.status_code != 200:
+            print(f"[hmtwatches.store] HTTP {resp.status_code} — skipping")
+            return []
+        tag = BeautifulSoup(resp.text, "lxml").select_one("#__NEXT_DATA__")
+        if not tag:
+            return []
+        data = json.loads(tag.get_text())
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        print(f"[hmtwatches.store] Error: {exc}")
+        return []
+
+    seen_skus: set[str] = set()
+    results: list[monitor.CheckResult] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            sku = node.get("sku")
+            name = node.get("name")
+            opts = node.get("buyingOptions")
+            if isinstance(sku, str) and isinstance(name, str) and isinstance(opts, dict):
+                low = name.lower()
+                if "kohinoor" in low and "automatic" not in low and sku not in seen_skus:
+                    seen_skus.add(sku)
+                    avail = (opts.get("singlePurchase") or {}).get("availability") or {}
+                    in_stock = bool(avail.get("inStock") and avail.get("isBuyable"))
+                    price_val = node.get("sellingPrice") or node.get("mrp") or "N/A"
+                    price = f"₹{price_val}" if price_val != "N/A" else "N/A"
+                    results.append(
+                        monitor.CheckResult(
+                            product_id=f"store-{sku}",
+                            name=f"{name} [hmtwatches.store]",
+                            url=f"https://www.hmtwatches.store/product/{sku}",
+                            status="in_stock" if in_stock else "out_of_stock",
+                            price=price,
+                        )
+                    )
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    in_stock_count = sum(1 for r in results if r.status == "in_stock")
+    print(f"[hmtwatches.store] Checked {len(results)} Kohinoor Quartz listings ({in_stock_count} in stock)")
+    return results
+
+
 def maybe_send_daily_heartbeat(state: dict, watch_count: int) -> None:
     """Sends one daily 'alive' ping between 8:45 AM and 9:00 AM IST."""
     now_ist = monitor.datetime.now(monitor.IST)
@@ -154,7 +212,7 @@ def maybe_send_daily_heartbeat(state: dict, watch_count: int) -> None:
     if (8 * 60 + 45) <= minutes <= (9 * 60) and state.get("_last_heartbeat_date") != today:
         peak_s = os.getenv("PEAK_POLL_SECONDS", "35")
         send_telegram_notice(
-            f"HMT Tracker alive — watching {watch_count} Kohinoor Quartz watches ({peak_s}s peak mode active)."
+            f"HMT Tracker alive — watching {watch_count} Kohinoor Quartz listings across hmtwatches.in & hmtwatches.store ({peak_s}s peak mode)."
         )
         state["_last_heartbeat_date"] = today
 
@@ -165,49 +223,50 @@ async def run_collection_cycle_async() -> bool:
     baseline_done = state.get("_baseline_done", False)
     now = time.time()
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    total_valid = 0
-    total_checked = 0
+    all_results: list[monitor.CheckResult] = []
 
     async with httpx.AsyncClient(http2=True, follow_redirects=True) as client:
+        # 1. Check hmtwatches.in Kohinoor Quartz pages
         for kw in SEARCH_KEYWORDS:
             watches = await get_cached_urls(client, kw)
             if not watches:
                 continue
-
             results = await asyncio.gather(*(check_one_async(client, sem, w) for w in watches))
-            total_checked += len(results)
-            valid_results = [r for r in results if r.status != "unknown"]
-            total_valid += len(valid_results)
             in_stock_count = sum(1 for r in results if r.status == "in_stock")
-            print(f"[{kw}] Checked {len(results)} Quartz pages directly ({in_stock_count} in stock)")
+            print(f"[hmtwatches.in:{kw}] Checked {len(results)} Quartz pages ({in_stock_count} in stock)")
+            all_results.extend(results)
 
-            for result in valid_results:
-                entry = items.get(result.product_id, {"status": "unknown", "last_alerted_at": 0})
-                prev_status = entry["status"]
+        # 2. Check hmtwatches.store Kohinoor Quartz listings (1 single request)
+        store_results = await check_hmt_store(client)
+        all_results.extend(store_results)
 
-                cooldown_ok = (now - entry.get("last_alerted_at", 0)) >= monitor.COOLDOWN_SECONDS
-                should_alert = (
-                    baseline_done
-                    and result.status == "in_stock"
-                    and prev_status != "in_stock"
-                    and cooldown_ok
-                )
+    valid_results = [r for r in all_results if r.status != "unknown"]
+    for result in valid_results:
+        entry = items.get(result.product_id, {"status": "unknown", "last_alerted_at": 0})
+        prev_status = entry["status"]
 
-                if should_alert:
-                    try:
-                        monitor.send_telegram(result)
-                        entry["last_alerted_at"] = now
-                        print(f"  RESTOCK ALERT SENT: {result.name} ({result.price})")
-                    except Exception as exc:
-                        print(f"  Telegram failed for {result.name}: {exc} (will retry next cycle)")
-                        continue
+        cooldown_ok = (now - entry.get("last_alerted_at", 0)) >= monitor.COOLDOWN_SECONDS
+        should_alert = (
+            baseline_done
+            and result.status == "in_stock"
+            and prev_status != "in_stock"
+            and cooldown_ok
+        )
 
-                entry["status"] = result.status
-                entry["last_checked_at"] = now
-                items[result.product_id] = entry
+        if should_alert:
+            try:
+                monitor.send_telegram(result)
+                entry["last_alerted_at"] = now
+                print(f"  RESTOCK ALERT SENT: {result.name} ({result.price})")
+            except Exception as exc:
+                print(f"  Telegram failed for {result.name}: {exc} (will retry next cycle)")
+                continue
 
-    # Track consecutive failed cycles (WAF block / HMT outage detection)
-    if total_valid == 0:
+        entry["status"] = result.status
+        entry["last_checked_at"] = now
+        items[result.product_id] = entry
+
+    if not valid_results:
         errors = state.get("_consecutive_errors", 0) + 1
         state["_consecutive_errors"] = errors
         if errors == ERROR_ALERT_THRESHOLD:
@@ -217,10 +276,10 @@ async def run_collection_cycle_async() -> bool:
     else:
         state["_consecutive_errors"] = 0
         state["_baseline_done"] = True
-        maybe_send_daily_heartbeat(state, total_checked)
+        maybe_send_daily_heartbeat(state, len(all_results))
 
     save_state(state)
-    return total_valid > 0
+    return len(valid_results) > 0
 
 
 def run_collection_cycle() -> bool:
@@ -250,7 +309,6 @@ if __name__ == "__main__":
         healthy = run_collection_cycle()
         if os.getenv("LOOP") != "1":
             break
-        # Auto cool-off for 3 minutes if HMT throttles or times out
         sleep_s = get_poll_interval() if healthy else 180.0
         if deadline and (time.time() + sleep_s) >= deadline:
             break
